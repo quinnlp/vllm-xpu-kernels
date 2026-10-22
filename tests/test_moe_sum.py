@@ -117,12 +117,12 @@ def test_moe_sum_input_validation():
     with pytest.raises(RuntimeError, match="same dtype"):
         moe_sum(input, bad_out)
 
-    # non-contiguous input (a strided slice along hidden).
-    wide = torch.randn((m, topk, k * 2), device="xpu", dtype=torch.float32)
-    noncontig = wide[:, :, ::2]  # shape [m, topk, k], non-contiguous
-    assert not noncontig.is_contiguous()
-    with pytest.raises(RuntimeError, match="contiguous"):
-        moe_sum(noncontig, output)
+    # non-contiguous output (a strided slice along hidden).
+    wide_out = torch.empty((m, k * 2), device="xpu", dtype=torch.float32)
+    noncontig_out = wide_out[:, ::2]  # shape [m, k], non-contiguous
+    assert not noncontig_out.is_contiguous()
+    with pytest.raises(RuntimeError, match="contiguous output"):
+        moe_sum(input, noncontig_out)
 
     # topk_ids with a wrong shape.
     with pytest.raises(RuntimeError, match="num_tokens, topk"):
@@ -131,3 +131,28 @@ def test_moe_sum_input_validation():
     # expert_map with a non-int32 dtype.
     with pytest.raises(RuntimeError, match="expert_map must be int32"):
         moe_sum(input, output, topk_ids, expert_map.to(torch.int64))
+
+
+@pytest.mark.parametrize("m", [1, 33, 222])
+@pytest.mark.parametrize("topk", TOP_KS)
+@pytest.mark.parametrize("k", [128, 511])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16],
+                         ids=format_tc)
+@pytest.mark.parametrize("layout", ["transpose", "slice"])
+def test_moe_sum_noncontiguous_input(m: int, topk: int, k: int,
+                                     dtype: torch.dtype, layout: str):
+    if layout == "transpose":
+        input = torch.randn((m, k, topk), device="xpu",
+                            dtype=dtype).transpose(1, 2)
+    else:
+        input = torch.randn((m, 2 * topk, k), device="xpu",
+                            dtype=dtype)[:, ::2, :]
+    assert not input.is_contiguous()
+    actual = torch.empty((m, k), device="xpu", dtype=dtype)
+
+    expected = input.float().sum(dim=1).to(dtype)
+    moe_sum(input, actual)
+
+    torch.testing.assert_close(actual, expected, atol=2e-2, rtol=0)
+
+    opcheck(torch.ops._moe_C.moe_sum, (input, actual, None, None))
