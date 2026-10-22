@@ -198,3 +198,64 @@ def test_cp_gather_indexer_k_quant_cache_correctness(batch_seq_lens,
 
     assert all_fp8_match, f"FP8 data mismatch [{tag}]"
     assert all_scale_match, f"Scale mismatch [{tag}]"
+
+
+# Upper bounds that select different work-group token parallelism.
+@pytest.mark.parametrize("upper_bound_tokens", [13, 100])
+def test_cp_gather_indexer_k_quant_cache_upper_bound_output(
+        upper_bound_tokens):
+    # dst may be over-allocated to avoid a D2H sync on the caller side. Only
+    # the tokens covered by cu_seq_lens are gathered; the rest stay untouched.
+    head_dim = 128
+    quant_block_size = 128
+    num_groups = head_dim // quant_block_size
+    cache_stride = head_dim + num_groups * 4
+    block_size = 16
+    batch_seq_lens = [3, 3, 3]
+    valid_tokens = sum(batch_seq_lens)
+    sentinel = 123
+
+    torch.manual_seed(0)
+    k = torch.randn((valid_tokens, head_dim),
+                    device=DEVICE,
+                    dtype=torch.bfloat16)
+    kv_cache = torch.zeros((len(batch_seq_lens), block_size, cache_stride),
+                           dtype=torch.uint8,
+                           device=DEVICE)
+    slot_mapping = torch.tensor(
+        [b * block_size + pos for b, n in enumerate(batch_seq_lens)
+         for pos in range(n)],
+        dtype=torch.int64,
+        device=DEVICE)
+    ops.indexer_k_quant_and_cache(k, kv_cache, slot_mapping, quant_block_size,
+                                  "ue8m0")
+
+    block_table = torch.arange(len(batch_seq_lens),
+                               dtype=torch.int32,
+                               device=DEVICE).unsqueeze(1)
+    cu_seq_lens = torch.tensor([0, 3, 6, 9], dtype=torch.int32, device=DEVICE)
+
+    dst_k_ref = torch.zeros((valid_tokens, head_dim),
+                            dtype=torch.uint8,
+                            device=DEVICE)
+    dst_s_ref = torch.zeros((valid_tokens, num_groups * 4),
+                            dtype=torch.uint8,
+                            device=DEVICE)
+    ref_cp_gather_indexer_k_quant_cache(kv_cache, dst_k_ref, dst_s_ref,
+                                        block_table, cu_seq_lens)
+
+    dst_k = torch.full((upper_bound_tokens, head_dim),
+                       sentinel,
+                       dtype=torch.uint8,
+                       device=DEVICE)
+    dst_s = torch.full((upper_bound_tokens, num_groups * 4),
+                       sentinel,
+                       dtype=torch.uint8,
+                       device=DEVICE)
+    ops.cp_gather_indexer_k_quant_cache(kv_cache, dst_k, dst_s, block_table,
+                                        cu_seq_lens)
+
+    torch.testing.assert_close(dst_k[:valid_tokens], dst_k_ref)
+    torch.testing.assert_close(dst_s[:valid_tokens], dst_s_ref)
+    assert torch.all(dst_k[valid_tokens:] == sentinel)
+    assert torch.all(dst_s[valid_tokens:] == sentinel)

@@ -668,11 +668,14 @@ class cp_gather_indexer_k_quant_cache_kernel {
         static_cast<int>(item.get_group(1) * local_range_y + local_y) *
         VEC_SIZE;
 
-    // Initialise SLM to 0 before the search to avoid stale values
+    // Initialise SLM to -1 (no batch) before the search to avoid stale values
     // from the previous work-group that ran on the same EU.
     if (local_y == 0 && token_idx < num_tokens_) {
-      batch_idx_acc_[local_x] = 0;
+      batch_idx_acc_[local_x] = -1;
     }
+
+    // Make the initialisation visible before any thread records its batch.
+    sycl::group_barrier(item.get_group());
 
     for (int iter = 0; iter < (batch_size_ + local_range_y - 1) / local_range_y;
          ++iter) {
@@ -694,7 +697,13 @@ class cp_gather_indexer_k_quant_cache_kernel {
       return;
     }
 
+    // num_tokens may be an allocation upper bound when the caller avoids a
+    // D2H sync. Only tokens covered by the exact device-side cu_seq_lens are
+    // valid to gather.
     const int my_batch = batch_idx_acc_[local_x];
+    if (my_batch < 0) {
+      return;
+    }
     const int inbatch_seq_idx = token_idx - cu_seq_lens_[my_batch];
     const int block_idx = block_table_
         [my_batch * num_blocks_ + inbatch_seq_idx / cache_block_size_];
