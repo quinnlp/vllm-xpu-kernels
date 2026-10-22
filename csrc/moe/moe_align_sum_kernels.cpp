@@ -1278,21 +1278,22 @@ void moe_sum(
   const int topk = input.size(1);
 
   // This kernel indexes input/output with a contiguous linear layout (it does
-  // not use per-dim strides like the CUDA reference), so both must be
-  // contiguous, share dtype/device, and have matching element counts.
+  // not use per-dim strides like the CUDA reference), so the output must be
+  // contiguous, and a non-contiguous input (e.g. a transposed or sliced view,
+  // which the CUDA reference accepts) is copied to a contiguous one. Both must
+  // share dtype/device and have matching element counts.
   TORCH_CHECK(
       input.scalar_type() == output.scalar_type(),
       "moe_sum: input and output must have the same dtype");
   TORCH_CHECK(
       input.device() == output.device(),
       "moe_sum: input and output must be on the same device");
-  TORCH_CHECK(
-      input.is_contiguous() && output.is_contiguous(),
-      "moe_sum expects contiguous input and output");
+  TORCH_CHECK(output.is_contiguous(), "moe_sum expects a contiguous output");
   TORCH_CHECK(
       input.numel() == output.numel() * topk,
       "moe_sum: input shape must be [num_tokens, topk, hidden] matching output "
       "[num_tokens, hidden]");
+  const torch::Tensor input_contig = input.contiguous();
 
   // Pad-aware reduction is required whenever topk_ids is supplied: slots whose
   // (global) expert id is negative are padding/invalid, and -- when an
@@ -1343,7 +1344,7 @@ void moe_sum(
 #define VLLM_MOE_SUM_LAUNCH(TOPK_VAL)                                       \
   VLLM_DISPATCH_FLOATING_TYPES(input.scalar_type(), "moe_sum_kernel", [&] { \
     auto* out_ptr = output.data_ptr<scalar_t>();                            \
-    auto* in_ptr = input.data_ptr<scalar_t>();                              \
+    auto* in_ptr = input_contig.data_ptr<scalar_t>();                       \
     if (pad_aware) {                                                        \
       AT_DISPATCH_INDEX_TYPES(topk_ids->scalar_type(), "moe_sum_idx", [&] { \
         const auto* tk_ptr = topk_ids->data_ptr<index_t>();                 \
